@@ -28,6 +28,8 @@
 #include<ros/ros.h>
 #include<cv_bridge/cv_bridge.h>
 #include<sensor_msgs/Imu.h>
+#include<nav_msgs/Odometry.h>
+#include <tf/transform_broadcaster.h>
 
 #include<opencv2/core/core.hpp>
 
@@ -35,6 +37,11 @@
 #include"../include/ImuTypes.h"
 
 using namespace std;
+
+ORB_SLAM3::Frame frame = {};
+bool initialized = false;
+
+nav_msgs::Odometry odom;
 
 class ImuGrabber
 {
@@ -58,7 +65,7 @@ public:
 
     queue<sensor_msgs::ImageConstPtr> imgLeftBuf, imgRightBuf;
     std::mutex mBufMutexLeft,mBufMutexRight;
-   
+
     ORB_SLAM3::System* mpSLAM;
     ImuGrabber *mpImuGb;
 
@@ -74,12 +81,13 @@ public:
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "Stereo_Inertial");
-  ros::NodeHandle n("~");
+  ros::NodeHandle n("ORB_SLAM3");
   ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
   bool bEqual = false;
-  if(argc < 4 || argc > 5)
+  bool bView = true;
+  if(argc < 4 || argc > 6)
   {
-    cerr << endl << "Usage: rosrun ORB_SLAM3 Stereo_Inertial path_to_vocabulary path_to_settings do_rectify [do_equalize]" << endl;
+    cerr << endl << "Usage: rosrun ORB_SLAM3 Stereo_Inertial path_to_vocabulary path_to_settings do_rectify [do_equalize] [enable_view]" << endl;
     ros::shutdown();
     return 1;
   }
@@ -91,15 +99,21 @@ int main(int argc, char **argv)
     if(sbEqual == "true")
       bEqual = true;
   }
+  if(argc==6)
+  {
+    std::string sbView(argv[5]);
+    if(sbView == "false")
+      bView = false;
+  }
 
   // Create SLAM system. It initializes all system threads and gets ready to process frames.
-  ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_STEREO,true);
+  ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_STEREO,bView);
 
   ImuGrabber imugb;
   ImageGrabber igb(&SLAM,&imugb,sbRect == "true",bEqual);
-  
+
     if(igb.do_rectify)
-    {      
+    {
         // Load settings related to stereo calibration
         cv::FileStorage fsSettings(argv[2], cv::FileStorage::READ);
         if(!fsSettings.isOpened())
@@ -138,13 +152,93 @@ int main(int argc, char **argv)
     }
 
   // Maximum delay, 5 seconds
-  ros::Subscriber sub_imu = n.subscribe("/imu", 1000, &ImuGrabber::GrabImu, &imugb); 
+  ros::Subscriber sub_imu = n.subscribe("/imu", 1000, &ImuGrabber::GrabImu, &imugb);
   ros::Subscriber sub_img_left = n.subscribe("/camera/left/image_raw", 100, &ImageGrabber::GrabImageLeft,&igb);
   ros::Subscriber sub_img_right = n.subscribe("/camera/right/image_raw", 100, &ImageGrabber::GrabImageRight,&igb);
 
   std::thread sync_thread(&ImageGrabber::SyncWithImu,&igb);
 
-  ros::spin();
+  ros::Rate loop_rate(200);
+
+  ros::Publisher odom_pub = n.advertise<nav_msgs::Odometry>("odom", 100);
+  tf::TransformBroadcaster odom_broadcaster;
+
+  Eigen::Matrix3f rotm;
+  rotm << 0,1,0,-1,0,0,0,0,1;
+  const Eigen::Quaternionf rotq(rotm);
+
+  ros::Time current_time, last_time;
+  current_time = ros::Time::now();
+  last_time = ros::Time::now();
+  Sophus::SE3f prevTcw;
+
+  while (n.ok())
+  {
+    ros::spinOnce();               // check for incoming messages
+    current_time = ros::Time::now();
+
+    const Sophus::SE3f Tcw = frame.GetPose().inverse();
+
+    //first, we'll publish the transform over tf
+    geometry_msgs::TransformStamped odom_trans;
+    odom_trans.header.stamp = current_time;
+    odom_trans.header.frame_id = "odom";
+    odom_trans.child_frame_id = "base_link";
+
+    odom_trans.transform.translation.x = Tcw.translation()[1];
+    odom_trans.transform.translation.y = -Tcw.translation()[0];
+    odom_trans.transform.translation.z = Tcw.translation()[2];
+    const Eigen::Quaternionf rotted =  rotq*Tcw.so3().unit_quaternion();
+    odom_trans.transform.rotation.x = rotted.x();
+    odom_trans.transform.rotation.y = rotted.y();
+    odom_trans.transform.rotation.z = rotted.z();
+    odom_trans.transform.rotation.w = rotted.w();
+
+    //send the transform
+    odom_broadcaster.sendTransform(odom_trans);
+
+    /**
+     * This is a message object. You stuff it with data, and then publish it.
+     */
+
+
+    odom.header.stamp = current_time;
+    odom.header.frame_id = "odom";
+    odom.child_frame_id = "base_link";
+
+    odom.pose.pose.position.x = Tcw.translation()[1];
+    odom.pose.pose.position.y = -Tcw.translation()[0];
+    odom.pose.pose.position.z = Tcw.translation()[2];
+
+    odom.pose.pose.orientation.x = rotted.x();
+    odom.pose.pose.orientation.y = rotted.y();
+    odom.pose.pose.orientation.z = rotted.z();
+    odom.pose.pose.orientation.w = rotted.w();
+
+    double dt = (current_time - last_time).toSec();
+    const Sophus::SE3f diff = Tcw * prevTcw;
+
+    // odom.twist.twist.linear.x = diff.translation()[1]/dt;
+    // odom.twist.twist.linear.y = -diff.translation()[0]/dt;
+    // odom.twist.twist.linear.z = diff.translation()[2]/dt;
+    odom.twist.twist.linear.x = frame.GetVelocity()[1];
+    odom.twist.twist.linear.y = -frame.GetVelocity()[0];
+    odom.twist.twist.linear.z = frame.GetVelocity()[2];
+
+    prevTcw = frame.GetPose();
+
+    last_time = current_time;
+
+    /**
+     * The publish() function is how you send messages. The parameter
+     * is the message object. The type of this object must agree with the type
+     * given as a template parameter to the advertise<>() call, as was done
+     * in the constructor above.
+     */
+    odom_pub.publish(odom);
+    cout << "GO SLEEP!!!" << endl;
+    loop_rate.sleep();
+  }
 
   return 0;
 }
@@ -181,7 +275,7 @@ cv::Mat ImageGrabber::GetImage(const sensor_msgs::ImageConstPtr &img_msg)
   {
     ROS_ERROR("cv_bridge exception: %s", e.what());
   }
-  
+
   if(cv_ptr->image.type()==0)
   {
     return cv_ptr->image.clone();
@@ -251,6 +345,9 @@ void ImageGrabber::SyncWithImu()
           cv::Point3f acc(mpImuGb->imuBuf.front()->linear_acceleration.x, mpImuGb->imuBuf.front()->linear_acceleration.y, mpImuGb->imuBuf.front()->linear_acceleration.z);
           cv::Point3f gyr(mpImuGb->imuBuf.front()->angular_velocity.x, mpImuGb->imuBuf.front()->angular_velocity.y, mpImuGb->imuBuf.front()->angular_velocity.z);
           vImuMeas.push_back(ORB_SLAM3::IMU::Point(acc,gyr,t));
+          odom.twist.twist.angular.x = mpImuGb->imuBuf.front()->angular_velocity.x;
+          odom.twist.twist.angular.y = mpImuGb->imuBuf.front()->angular_velocity.y;
+          odom.twist.twist.angular.z = mpImuGb->imuBuf.front()->angular_velocity.z;
           mpImuGb->imuBuf.pop();
         }
       }
@@ -267,7 +364,8 @@ void ImageGrabber::SyncWithImu()
         cv::remap(imRight,imRight,M1r,M2r,cv::INTER_LINEAR);
       }
 
-      mpSLAM->TrackStereo(imLeft,imRight,tImLeft,vImuMeas);
+      frame = mpSLAM->TrackStereo(imLeft,imRight,tImLeft,vImuMeas);
+      initialized = frame.imuIsPreintegrated();
 
       std::chrono::milliseconds tSleep(1);
       std::this_thread::sleep_for(tSleep);
@@ -280,6 +378,28 @@ void ImuGrabber::GrabImu(const sensor_msgs::ImuConstPtr &imu_msg)
   mBufMutex.lock();
   imuBuf.push(imu_msg);
   mBufMutex.unlock();
+  if(initialized){
+  ORB_SLAM3::IMU::Preintegrated mpImuPreintegratedFromLastFrame(frame.mImuBias,frame.mImuCalib);
+  ORB_SLAM3::IMU::Point imudata(imu_msg->linear_acceleration.x,imu_msg->linear_acceleration.y,imu_msg->linear_acceleration.z,imu_msg->angular_velocity.x,imu_msg->angular_velocity.y,imu_msg->angular_velocity.z,imu_msg->header.stamp.toSec());
+  mpImuPreintegratedFromLastFrame.IntegrateNewMeasurement(imudata.a,imudata.w,imu_msg->header.stamp.toSec()-frame.mTimeStamp);
+
+  const Eigen::Vector3f twb1 = frame.GetImuPosition();
+  const Eigen::Matrix3f Rwb1 = frame.GetImuRotation();
+  const Eigen::Vector3f Vwb1 = frame.GetVelocity();
+  const Eigen::Vector3f Gz(0, 0, -ORB_SLAM3::IMU::GRAVITY_VALUE);
+  const float t12 = mpImuPreintegratedFromLastFrame.dT;
+
+  Eigen::Matrix3f Rwb2 = ORB_SLAM3::IMU::NormalizeRotation(Rwb1 * mpImuPreintegratedFromLastFrame.GetDeltaRotation(frame.mImuBias));
+  Eigen::Vector3f twb2 = twb1 + Vwb1*t12 + 0.5f*t12*t12*Gz+ Rwb1 * mpImuPreintegratedFromLastFrame.GetDeltaPosition(frame.mImuBias);
+  Eigen::Vector3f Vwb2 = Vwb1 + t12*Gz + Rwb1 * mpImuPreintegratedFromLastFrame.GetDeltaVelocity(frame.mImuBias);
+  if(Rwb2.determinant()>0){
+  frame.mTimeStamp = imu_msg->header.stamp.toSec();
+  frame.SetImuPoseVelocity(Rwb2,twb2,Vwb2);
+  }
+  odom.twist.twist.angular.x = -imu_msg->angular_velocity.z;
+  odom.twist.twist.angular.y = imu_msg->angular_velocity.y;
+  odom.twist.twist.angular.z = -imu_msg->angular_velocity.x;
+  }
   return;
 }
 

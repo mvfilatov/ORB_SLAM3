@@ -1,3 +1,4 @@
+add_compile_options(-std=c++14)
 cmake_minimum_required(VERSION 2.8)
 project(ORB_SLAM3)
 
@@ -30,7 +31,7 @@ endif()
 
 LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules)
 
-find_package(OpenCV 4.4)
+find_package(OpenCV 4 REQUIRED)
    if(NOT OpenCV_FOUND)
       message(FATAL_ERROR "OpenCV > 4.4 not found.")
    endif()

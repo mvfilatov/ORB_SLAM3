@@ -66,7 +66,7 @@ public:
         mpSystem = pSystem;
     }
 
-    // Main thread function. 
+    // Main thread function.
     void Run();
 
     void SetCameraCalibration(const float &fx_, const float &fy_, const float &cx_, const float &cy_){
@@ -114,5 +114,3 @@ private:
 
 
 #endif // VIEWERAR_H
-	
-
